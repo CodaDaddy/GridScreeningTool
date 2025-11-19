@@ -87,6 +87,8 @@ def is_valid_feature(feature):
     return True
 
 
+
+
 # ========= Streamlit app =========
 
 st.set_page_config(page_title="Grid Screening Tool – Spain", layout="wide")
