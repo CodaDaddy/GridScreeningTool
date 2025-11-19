@@ -12,17 +12,17 @@ from pyproj import Transformer
 utm30_to_wgs84 = Transformer.from_crs("EPSG:32630", "EPSG:4326", always_xy=True)
 
 
-def convert_spain_to_wgs84(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+def convert_spain_to_wgs84(df: pd.DataFrame, source_name: str | None = None) -> pd.DataFrame:
     """
     Convert standard REE-style Spain capacity file with
     'Coordenada UTM X' / 'Coordenada UTM Y' to WGS84 lat/lon.
-    Adds 'lon_wgs', 'lat_wgs' and 'source_file'.
+    Creates 'lon_wgs', 'lat_wgs', and optional 'source_file'.
     """
     df = df.copy()
     required_cols = ["Coordenada UTM X", "Coordenada UTM Y"]
     for c in required_cols:
         if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}' in Spain file '{source_name}'.")
+            raise ValueError(f"Missing required column '{c}' in Spain file '{source_name or ''}'.")
 
     df["Coordenada UTM X"] = pd.to_numeric(df["Coordenada UTM X"], errors="coerce")
     df["Coordenada UTM Y"] = pd.to_numeric(df["Coordenada UTM Y"], errors="coerce")
@@ -33,7 +33,9 @@ def convert_spain_to_wgs84(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
 
     df["lon_wgs"] = lons
     df["lat_wgs"] = lats
-    df["source_file"] = source_name
+
+    if source_name is not None:
+        df["source_file"] = source_name
 
     # keep only valid coords
     df.loc[
@@ -57,7 +59,10 @@ def load_substations(path: str):
 
 
 def is_valid_feature(feature):
-    """Return True only if the feature has clean geometry + relevant info."""
+    """
+    Return True only if the feature has clean geometry + relevant info.
+    Filters OUT all substations where voltage is not known.
+    """
     geom = feature.get("geometry")
     if not geom:
         return False
@@ -81,12 +86,88 @@ def is_valid_feature(feature):
     voltage = props.get("voltage")
     operator = props.get("operator")
 
-    if not name and not operator and not voltage:
+    # require a non-empty voltage value
+    if not voltage:
+        return False
+
+    # basic quality requirement
+    if not name and not operator:
         return False
 
     return True
 
 
+# ========= Transmission lines (GeoJSON) helpers =========
+
+@st.cache_data
+def load_lines(path: str = "line.geojson"):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def line_style_function(feature):
+    """Color OSM lines by voltage."""
+    props = feature.get("properties", {})
+    v_raw = str(props.get("voltage", ""))
+
+    try:
+        v = int(v_raw.split(";")[0])   # handle "400000;220000"
+    except Exception:
+        v = None
+
+    color = "#666666"
+    weight = 2
+
+    if v is not None:
+        if v >= 380000:
+            color, weight = "#d73027", 3      # ~400 kV
+        elif v >= 220000:
+            color, weight = "#fc8d59", 2.5    # ~220 kV
+        elif v >= 110000:
+            color = "#4575b4"                 # ~110 kV
+
+    return {"color": color, "weight": weight, "opacity": 0.9}
+
+
+def build_line_popup_html(props: dict) -> str:
+    """Card-style popup for each transmission line."""
+    name = props.get("name", "Transmission line")
+    operator = props.get("operator", "Unknown")
+    voltage_raw = str(props.get("voltage", "Unknown"))
+    voltage_kv = props.get("voltage_kv")
+    circuits = props.get("circuits", "N/A")
+    cables = props.get("cables", "N/A")
+    freq = props.get("frequency", "N/A")
+
+    voltage_str = f"{voltage_kv:.1f} kV" if isinstance(voltage_kv, (int, float)) and not pd.isna(voltage_kv) else voltage_raw
+
+    popup_html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                width: 260px; padding: 8px 10px;">
+      <div style="font-size:16px; font-weight:600; margin-bottom:2px;">{name}</div>
+      <div style="font-size:12px; color:#666; margin-bottom:6px;">
+        ⚙️ Operator: {operator}
+      </div>
+      <div style="height:1px; background-color:#555; margin:4px 0 8px 0;"></div>
+
+      <div style="border-radius:8px; background:#f7f7f9; padding:8px; margin-bottom:6px;">
+        <div style="font-size:12px; font-weight:600; margin-bottom:4px;">
+          ⚡ Electrical characteristics
+        </div>
+        <div style="font-size:12px; color:#333;">
+          <b>Voltage:</b> {voltage_str}<br>
+          <b>Circuits:</b> {circuits}<br>
+          <b>Cables:</b> {cables}<br>
+          <b>Frequency:</b> {freq}
+        </div>
+      </div>
+
+      <div style="font-size:10px; color:#999;">
+        Data: OpenStreetMap / OpenInfraMap
+      </div>
+    </div>
+    """
+    return popup_html
 
 
 # ========= Streamlit app =========
@@ -94,21 +175,26 @@ def is_valid_feature(feature):
 st.set_page_config(page_title="Grid Screening Tool – Spain", layout="wide")
 st.title("🛰️ Ingrid Capacity – Grid Screening Tool")
 
+# ------ Sidebar: optional OSM line layer ------
+st.sidebar.header("🧩 Optional layers")
+show_lines = st.sidebar.checkbox("Show OSM transmission lines (line.geojson)", value=False)
+
 st.markdown(
     """
 This app shows on **one map**:
 
-- 🔌 **Spain grid connection points** from **one or more** REE capacity files  
-- 🏭 **OSM substations** from `spain_substations.geojson`  
+- 🔌 **Spain grid connection points** (one or more REE capacity exports)  
+- 🏭 **OSM substations** from `spain_substations.geojson` (only with known voltage)  
+- 🌐 **OSM transmission lines** from `line.geojson` (optional checkbox, click line → card popup)  
 - On top of **OpenStreetMap + OpenInfraMap** grid tiles
 """
 )
 
-# ------ Sidebar: MULTIPLE REE capacity uploads ------
+# ------ Sidebar: REE capacity upload (MULTI-FILE) ------
 st.sidebar.header("📂 Spain capacity input")
 
 spain_files = st.sidebar.file_uploader(
-    "Upload one or more Spain capacity Excels (REE capacity map export)",
+    "Upload one or more Spain capacity Excel files (REE capacity map export)",
     type=["xlsx"],
     accept_multiple_files=True,
 )
@@ -120,31 +206,34 @@ prov_col = muni_col = None
 if spain_files:
     converted = []
     read_errors = []
+
     for f in spain_files:
         try:
             df_raw = pd.read_excel(f)
             if df_raw.empty:
                 read_errors.append(f"{f.name}: file is empty")
                 continue
-            df_conv = convert_spain_to_wgs84(df_raw, f.name)
+
+            df_conv = convert_spain_to_wgs84(df_raw, source_name=f.name)
             converted.append(df_conv)
+
         except Exception as e:
             read_errors.append(f"{f.name}: {e}")
 
     if read_errors:
-        st.sidebar.error("Some files could not be parsed:\n- " + "\n- ".join(read_errors))
+        st.sidebar.error("Some capacity files could not be parsed:\n- " + "\n- ".join(read_errors))
 
     if converted:
         spain_df = pd.concat(converted, ignore_index=True)
 
         # Typical REE column names
         cols = spain_df.columns
-        name_col      = "Nombre Subestación"         if "Nombre Subestación"         in cols else None
-        volt_col      = "Nivel de Tensión (kV)"      if "Nivel de Tensión (kV)"      in cols else None
-        cap_avail_col = "Capacidad disponible (MW)"  if "Capacidad disponible (MW)"  in cols else None
-        cap_occ_col   = "Capacidad ocupada (MW)"     if "Capacidad ocupada (MW)"     in cols else None
-        prov_col      = "Provincia"                  if "Provincia"                  in cols else None
-        muni_col      = "Municipio"                  if "Municipio"                  in cols else None
+        name_col       = "Nombre Subestación"         if "Nombre Subestación"         in cols else None
+        volt_col       = "Nivel de Tensión (kV)"      if "Nivel de Tensión (kV)"      in cols else None
+        cap_avail_col  = "Capacidad disponible (MW)"  if "Capacidad disponible (MW)"  in cols else None
+        cap_occ_col    = "Capacidad ocupada (MW)"     if "Capacidad ocupada (MW)"     in cols else None
+        prov_col       = "Provincia"                  if "Provincia"                  in cols else None
+        muni_col       = "Municipio"                  if "Municipio"                  in cols else None
 
         # Make numeric for filtering
         if volt_col:
@@ -156,7 +245,7 @@ if spain_files:
 
         st.sidebar.subheader("Filters")
 
-        # ------- Voltage filter (robust to single value / rounding) -------
+        # ------- Voltage filter (robust) -------
         if volt_col and spain_df[volt_col].notna().any():
             vmin = float(spain_df[volt_col].min())
             vmax = float(spain_df[volt_col].max())
@@ -216,7 +305,7 @@ try:
         lon, lat = feature["geometry"]["coordinates"]
         substation_coords.append((lat, lon))
 except FileNotFoundError:
-    st.warning("spain_substations.geojson not found in this folder. OSM substations layer will be missing.")
+    st.warning("spain_substations.geojson not found in this folder. OSM substation layer will be missing.")
 except Exception as e:
     st.warning(f"Could not load spain_substations.geojson: {e}")
     substations = None
@@ -224,9 +313,9 @@ except Exception as e:
 
 # ------ Metrics ------
 st.metric("REE connection points on map (all files)", len(spain_df) if spain_df is not None else 0)
-st.metric("OSM substations (clean) on map", len(substation_coords))
+st.metric("OSM substations (known voltage) on map", len(substation_coords))
 
-st.subheader("🗺️ Map: REE connection points + OSM substations + OpenInfraMap grid")
+st.subheader("🗺️ Map: REE connection points + OSM substations + OSM lines + OpenInfraMap grid")
 
 # ------ Decide center based on all available coords ------
 all_lat = []
@@ -240,12 +329,12 @@ for lat, lon in substation_coords:
     all_lat.append(lat)
     all_lon.append(lon)
 
+# Fallback center on Spain if nothing else loaded
 if not all_lat or not all_lon:
-    st.info("No coordinates available yet. Upload one or more REE capacity files and/or provide spain_substations.geojson.")
-    st.stop()
-
-center_lat = sum(all_lat) / len(all_lat)
-center_lon = sum(all_lon) / len(all_lon)
+    center_lat, center_lon = 40.0, -3.7
+else:
+    center_lat = sum(all_lat) / len(all_lat)
+    center_lon = sum(all_lon) / len(all_lon)
 
 # ------ Build Folium map ------
 m = folium.Map(
@@ -286,9 +375,49 @@ folium.TileLayer(
     control=True,
 ).add_to(m)
 
-# ------ Add OSM substations (blue circles) ------
+# ------ Optional: OSM transmission lines (GeoJSON, card popup) ------
+if show_lines:
+    try:
+        lines = load_lines("line.geojson")
+
+        # Enrich properties with voltage in kV and prebuild popup html
+        for feat in lines.get("features", []):
+            props = feat.get("properties", {})
+            v_raw = str(props.get("voltage", ""))
+            try:
+                props["voltage_kv"] = int(v_raw.split(";")[0]) / 1000.0
+            except Exception:
+                props["voltage_kv"] = None
+
+            props["popup_html"] = build_line_popup_html(props)
+
+        folium.GeoJson(
+            lines,
+            name="OSM transmission lines",
+            style_function=line_style_function,
+            highlight_function=lambda feat: {
+                "weight": 5,
+                "color": "#000000",
+                "opacity": 1.0,
+            },
+            # NO tooltip -> no annoying hover box, only click popup
+            popup=folium.GeoJsonPopup(
+                fields=["popup_html"],
+                aliases=[""],
+                localize=True,
+                labels=False,
+                max_width=320,
+            ),
+        ).add_to(m)
+
+    except FileNotFoundError:
+        st.warning("line.geojson not found in this folder. Transmission line layer will be missing.")
+    except Exception as e:
+        st.warning(f"Could not load line.geojson: {e}")
+
+# ------ Add OSM substations (blue circles, only known voltage) ------
 if substations is not None:
-    fg_sub = folium.FeatureGroup(name="OSM Substations (GeoJSON)")
+    fg_sub = folium.FeatureGroup(name="OSM Substations (GeoJSON, known voltage)")
     for feature in substations.get("features", []):
         if not is_valid_feature(feature):
             continue
@@ -318,7 +447,7 @@ if substations is not None:
 
     fg_sub.add_to(m)
 
-# ------ Add REE capacity points (red plug markers, from ALL files) ------
+# ------ Add REE capacity points (red plug markers with "card" popup, ALL FILES) ------
 if spain_df is not None and not spain_df.empty:
     fg_es = folium.FeatureGroup(name="Spain connection points (REE, all files)")
     mc_es = MarkerCluster().add_to(fg_es)
@@ -329,6 +458,7 @@ if spain_df is not None and not spain_df.empty:
 
         source = row.get("source_file", "")
 
+        # Base info
         name = row.get(name_col, "Connection point") if name_col else "Connection point"
         province = row.get(prov_col, "") if prov_col else ""
         municipio = row.get(muni_col, "") if muni_col else ""
@@ -337,6 +467,7 @@ if spain_df is not None and not spain_df.empty:
         voltage_val = row.get(volt_col, "") if volt_col else ""
         voltage_str = f"{voltage_val} kV" if voltage_val != "" else "N/A"
 
+        # Capacity info
         avail = float(row.get(cap_avail_col, 0) or 0) if cap_avail_col else 0.0
         occ   = float(row.get(cap_occ_col, 0) or 0)   if cap_occ_col   else 0.0
         total = avail + occ
@@ -347,6 +478,7 @@ if spain_df is not None and not spain_df.empty:
         occ_str   = f"{occ:.1f} MW"
         no_capacity_flag = (avail <= 0.0)
 
+        # Card-style popup HTML
         popup_html = f"""
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                     width: 260px; padding: 8px 10px;">
