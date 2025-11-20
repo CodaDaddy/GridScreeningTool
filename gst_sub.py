@@ -315,7 +315,7 @@ except Exception as e:
 st.metric("REE connection points on map (all files)", len(spain_df) if spain_df is not None else 0)
 st.metric("OSM substations (known voltage) on map", len(substation_coords))
 
-st.subheader("🗺️ Map: REE connection points + OSM substations + OSM lines + OpenInfraMap grid")
+st.subheader("🗺️ Grid Screening Map")
 
 # ------ Decide center based on all available coords ------
 all_lat = []
@@ -374,6 +374,28 @@ folium.TileLayer(
     overlay=True,
     control=True,
 ).add_to(m)
+
+
+# =======================================================
+# 1) Natura 2000 – protected areas (hard constraints)
+# =======================================================
+folium.WmsTileLayer(
+    url="https://wms.mapama.gob.es/sig/Biodiversidad/RedNatura",
+    name="Natura 2000 (protected sites)",
+    layers="PS.ProtectedSite",        # from service metadata
+    fmt="image/png",
+    transparent=True,
+    version="1.3.0",
+    attr="© MITECO – Red Natura 2000",
+    overlay=True,
+    control=True,
+).add_to(m)
+
+# =======================================================
+# 2) Land cover / land use (forest, wetlands, etc.)
+#    (example: Soil Occupation / CORINE+SIOSE WMS)
+# =======================================================
+
 
 # ------ Optional: OSM transmission lines (GeoJSON, card popup) ------
 if show_lines:
